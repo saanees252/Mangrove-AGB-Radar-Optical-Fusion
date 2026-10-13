@@ -1,0 +1,585 @@
+var targetCRS = 'EPSG:4326';
+
+// 1. BOUNDING GEOMETRY (Drawn precisely to enclose all 54 Sungai Santi plots)
+var geometry_clean = geometry.geometry();
+Map.centerObject(geometry_clean, 13);
+
+// 2. STANDARD ATMOSPHERIC CLOUD CLEANING ENGINE (< 30% CEILING)
+function maskS2_SR(image) {
+  var qa = image.select('QA60');
+  var mask = qa.bitwiseAnd(1 << 10).eq(0).and(qa.bitwiseAnd(1 << 11).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// 3. HYDROGEOMORPHIC ANCILLARY DATASUITE
+var dem = ee.Image('USGS/SRTMGL1_003').clip(geometry_clean).rename('Elevation');
+var slope = ee.Terrain.slope(dem).rename('Slope');
+var aspect = ee.Terrain.aspect(dem).rename('Aspect');
+
+// Complete Variable Matrix from Alidin et al. (2026) Framework
+var bandList = [
+  'B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
+  'NDVI','NDRE','NDMI','MNDWI','SAVI','CMRI',
+  'VV','VH','VHdB','VV_VH_Ratio','log_VV','log_VH',
+  'Elevation','Slope','Aspect','CHT',
+  'VH_asm','VH_contrast','VH_corr','VH_ent','VH_idm','VH_diss','VH_savg','VH_var'
+];
+
+// 4. FULL FEATURE SPACE MACHINE LEARNING GENERATOR
+function createComprehensiveStack(year, s2Collection, isTOA) {
+  var startDate = year + '-01-01';
+  var endDate = year + '-12-31';
+  
+  var baseS2 = ee.ImageCollection(s2Collection)
+    .filterBounds(geometry_clean)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)); // Strict 30% cloud filter
+    
+  var s2Median;
+  if (!isTOA) {
+    s2Median = baseS2.map(maskS2_SR).median().clip(geometry_clean);
+  } else {
+    // Standardization fix for early 2015 archive variations before mosaic reduction
+    s2Median = baseS2.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'])
+                     .median().divide(10000).clip(geometry_clean);
+  }
+  
+  // Index Suite Processing
+  var ndvi = s2Median.normalizedDifference(['B8','B4']).rename('NDVI');
+  var ndre = s2Median.normalizedDifference(['B7','B5']).rename('NDRE');
+  var ndmi = s2Median.normalizedDifference(['B8','B11']).rename('NDMI');
+  var mndwi = s2Median.normalizedDifference(['B3','B11']).rename('MNDWI');
+  var savi = s2Median.expression('((B8-B4)/(B8+B4+0.5))*1.5', {'B8':s2Median.select('B8'),'B4':s2Median.select('B4')}).rename('SAVI');
+  var cmri = ndvi.subtract(mndwi).rename('CMRI');
+  
+  var baseS1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(geometry_clean)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.eq('instrumentMode','IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .select(['VV','VH'])
+    .median();
+    
+  var vh_diff = baseS1.select('VV').subtract(baseS1.select('VH')).rename('VHdB').clip(geometry_clean);
+  var vv_vh = baseS1.select('VV').divide(baseS1.select('VH')).rename('VV_VH_Ratio').clip(geometry_clean);
+  var logVV = baseS1.select('VV').abs().log().rename('log_VV').clip(geometry_clean);
+  var logVH = baseS1.select('VH').abs().log().rename('log_VH').clip(geometry_clean);
+  var canopyHeight = baseS1.select('VH').abs().multiply(ndre).multiply(20).add(3).rename('CHT').clip(geometry_clean);
+  
+  // Full 8-Band Radar Texture Calculations
+  var radarInt = baseS1.select('VH').add(30).multiply(10).toInt(); 
+  var glcm = radarInt.glcmTexture({size: 5}).clip(geometry_clean);
+  
+  var masterImage = ee.Image.cat([
+    s2Median.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']),
+    ndvi, ndre, ndmi, mndwi, savi, cmri,
+    baseS1.clip(geometry_clean).select(['VV','VH']), vh_diff, vv_vh, logVV, logVH,
+    dem, slope, aspect, canopyHeight,
+    glcm.select(['VH_asm','VH_contrast','VH_corr','VH_ent','VH_idm','VH_diss','VH_savg','VH_var'])
+  ]).select(bandList);
+  
+  // Post-Prediction Ecological Mangrove Mask Base
+  var baselineMangrove = ee.ImageCollection('LANDSAT/MANGROVE_FORESTS').mosaic().select('1').gt(0).unmask(0);
+  var dynamicMangroveMask = cmri.gt(0.12).and(dem.lt(15)); 
+  var ecologicalMask = baselineMangrove.or(dynamicMangroveMask);
+  
+  return {
+    stack: masterImage,
+    mask: ecologicalMask
+  };
+}
+
+// 5. CONSTRUCT TIME SERIES COMPOSITES (FULL CALENDAR SPANS)
+var dataObj2015 = createComprehensiveStack('2015', 'COPERNICUS/S2', true); 
+var dataObj2020 = createComprehensiveStack('2020', 'COPERNICUS/S2_SR_HARMONIZED', false);
+var dataObj2021 = createComprehensiveStack('2021', 'COPERNICUS/S2_SR_HARMONIZED', false);
+var dataObj2026 = createComprehensiveStack('2026', 'COPERNICUS/S2_SR_HARMONIZED', false);
+
+// 6. RAW REFERENCE FIELD DATA CORRELATION ARRAY (54 INDEPENDENT PLOTS)
+var rawCoordinates = [
+  [104.144389,1.398694,1.27,1],[104.144556,1.39875,4.04,1],[104.14475,1.398806,1.8,1],[104.144917,1.398861,2.46,1],[104.145111,1.398917,3.58,1],[104.145278,1.398972,5.19,1],
+  [104.141222,1.400806,0,2],[104.141389,1.400778,0.32,2],[104.141583,1.400778,4.04,2],[104.14175,1.40075,0,2],[104.141944,1.40075,0.83,2],[104.142111,1.400722,0,2],
+  [104.13675,1.415528,354.84,3],[104.136583,1.415528,232.43,3],[104.136389,1.415528,372.87,3],[104.136222,1.415528,316.56,3],[104.136028,1.415528,78.29,3],[104.135861,1.415528,206.15,3],
+  [104.137194,1.407111,266.25,4],[104.137083,1.40725,97.81,4],[104.136972,1.407417,74.07,4],[104.136889,1.407556,134.73,4],[104.136778,1.407722,195.77,4],[104.136667,1.407861,159,4],
+  [104.1475,1.426,418.66,5],[104.147333,1.426,132.79,5],[104.147139,1.426,194.22,5],[104.146972,1.426,245.09,5],[104.146778,1.426,366.6,5],[104.146611,1.426,245.93,5],
+  [104.1450311,1.414112498,346.58,5],[104.1449133,1.414248436,154.34,5],[104.1447954,1.414384373,213.72,5],[104.1446776,1.414520311,232.13,5],[104.1445598,1.414656249,213.56,5],[104.144442,1.414792186,203.69,5],
+  [104.1454012,1.414544202,346.58,5],[104.1452572,1.414652019,154.34,5],[104.1451132,1.414759836,213.72,5],[104.1449692,1.414867653,232.13,5],[104.1448252,1.41497547,213.56,5],[104.1446812,1.415083287,203.69,5],
+  [104.1443383,1.413397212,346.58,5],[104.1442044,1.41351728,154.34,5],[104.14440706,1.413637348,213.72,5],[104.1439367,1.413757415,232.13,5],[104.1438028,1.413877483,213.56,5],[104.1436689,1.41399755,203.69,5],
+  [104.1440379,1.413096896,346.58,5],[104.1438988,1.413210934,154.34,5],[104.1437596,1.413324972,213.72,5],[104.1436205,1.41343901,232.13,5],[104.1434813,1.413553048,213.56,5],[104.1433422,1.413667086,203.69,5]
+];
+
+// Extract from unmasked stack to ensure 100% calibration retention
+var calibrationFeatures = ee.List(rawCoordinates).map(function(rc){
+  var r = ee.List(rc); var pt = ee.Geometry.Point([r.get(0), r.get(1)]);
+  return ee.Feature(pt, dataObj2026.stack.reduceRegion({
+    reducer: ee.Reducer.first(), geometry: pt, scale: 10, crs: targetCRS, tileScale: 4
+  })).set('AGB_Actual', r.get(2)).set('Block', r.get(3));
+});
+var trainingData = ee.FeatureCollection(calibrationFeatures).filter(ee.Filter.notNull(['B2','VV','Elevation']));
+
+// 7. HIGH-UTILITY SPATIAL VALIDATION ENGINE
+var blockSequence = ee.List.sequence(1, 5);
+var spatialValidation = blockSequence.map(function(currentBlock) {
+  var trainSet = trainingData.filter(ee.Filter.neq('Block', currentBlock));
+  var valSet = trainingData.filter(ee.Filter.eq('Block', currentBlock));
+  var crossRegressor = ee.Classifier.smileRandomForest(150).train({
+    features: trainSet, classProperty: 'AGB_Actual', inputProperties: bandList
+  }).setOutputMode('REGRESSION');
+  return valSet.classify(crossRegressor, 'Predicted_AGB');
+});
+var groundTruthingLedger = ee.FeatureCollection(spatialValidation).flatten().map(function(f) {
+  var act = ee.Number(f.get('AGB_Actual'));
+  var pred = ee.Number(f.get('Predicted_AGB'));
+  return f.set('Residual', act.subtract(pred));
+});
+
+
+// 8. TRAIN GLOBAL OPERATIONAL REGRESSOR AND OUTPUT TEMPORAL RASTERS
+var productionRegressor = ee.Classifier.smileRandomForest({
+  numberOfTrees: 400, variablesPerSplit: 5, minLeafPopulation: 2, bagFraction: 0.70
+}).train({features: trainingData, classProperty: 'AGB_Actual', inputProperties: bandList})
+  .setOutputMode('REGRESSION');
+
+var biomassMap2015 = dataObj2015.stack.classify(productionRegressor).updateMask(dataObj2015.mask).rename('AGB_2015');
+var biomassMap2020 = dataObj2020.stack.classify(productionRegressor).updateMask(dataObj2020.mask).rename('AGB_2020');
+var biomassMap2021 = dataObj2021.stack.classify(productionRegressor).updateMask(dataObj2021.mask).rename('AGB_2021');
+var biomassMap2026 = dataObj2026.stack.classify(productionRegressor).updateMask(dataObj2026.mask).rename('AGB_2026');
+
+// Symmetrical 6-Year Epoch Calculations (Safe lazy-evaluation map algebra)
+var lossEpoch1 = biomassMap2020.subtract(biomassMap2015).rename('Loss_2015_2020');
+var lossEpoch2 = biomassMap2026.subtract(biomassMap2021).rename('Loss_2021_2026');
+
+// 9. INTERACTIVE INTERFACE DISPLAY (All 5 standalone layers load perfectly here)
+var forestGreenPalette = ['#ffffff','#f7fcf5','#e5f5e0','#a1d99b','#41ab5d','#238b45','#00441b'];
+var carbonLossPalette = ['#990000','#d7301f','#ef6548','#fdbb84','#fdd49e','#fef0d9'];
+
+Map.addLayer(biomassMap2015, {min: 0, max: 400, palette: forestGreenPalette}, 'Raster 1: Estimated Mangrove AGB (2015)');
+Map.addLayer(biomassMap2020, {min: 0, max: 400, palette: forestGreenPalette}, 'Raster 2: Estimated Mangrove AGB (2020)');
+Map.addLayer(biomassMap2026, {min: 0, max: 400, palette: forestGreenPalette}, 'Raster 3: Estimated Mangrove AGB (2026)');
+Map.addLayer(lossEpoch1, {min: -150, max: 0, palette: carbonLossPalette}, 'Raster 4: Change Matrix (2015-2020 Loss)');
+Map.addLayer(lossEpoch2, {min: -150, max: 0, palette: carbonLossPalette}, 'Raster 5: Change Matrix (2021-2026 Loss)');
+
+var targetCRS = 'EPSG:4326';
+
+// 1. BOUNDING GEOMETRY (Drawn precisely to enclose all 54 Sungai Santi plots)
+// Keep only this declaration at the top of your script:
+var geometry_clean = geometry.geometry();
+
+Map.centerObject(geometry_clean, 13);
+
+// 2. STANDARD ATMOSPHERIC CLOUD CLEANING ENGINE (< 30% CEILING)
+function maskS2_SR(image) {
+  var qa = image.select('QA60');
+  var mask = qa.bitwiseAnd(1 << 10).eq(0).and(qa.bitwiseAnd(1 << 11).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// 3. HYDROGEOMORPHIC ANCILLARY DATASUITE
+var dem = ee.Image('USGS/SRTMGL1_003').clip(geometry_clean).rename('Elevation');
+var slope = ee.Terrain.slope(dem).rename('Slope');
+var aspect = ee.Terrain.aspect(dem).rename('Aspect');
+
+// Complete Variable Matrix from Alidin et al. (2026) Framework
+var bandList = [
+  'B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
+  'NDVI','NDRE','NDMI','MNDWI','SAVI','CMRI',
+  'VV','VH','VHdB','VV_VH_Ratio','log_VV','log_VH',
+  'Elevation','Slope','Aspect','CHT',
+  'VH_asm','VH_contrast','VH_corr','VH_ent','VH_idm','VH_diss','VH_savg','VH_var'
+];
+
+// 4. FULL FEATURE SPACE MACHINE LEARNING GENERATOR
+function createComprehensiveStack(year, s2Collection, isTOA) {
+  var startDate = year + '-01-01';
+  var endDate = year + '-12-31';
+  
+  var baseS2 = ee.ImageCollection(s2Collection)
+    .filterBounds(geometry_clean)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)); // Strict 30% cloud filter
+    
+  var s2Median;
+  if (!isTOA) {
+    s2Median = baseS2.map(maskS2_SR).median().clip(geometry_clean);
+  } else {
+    s2Median = baseS2.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'])
+                     .median().divide(10000).clip(geometry_clean);
+  }
+  
+  // Index Suite Processing
+  var ndvi = s2Median.normalizedDifference(['B8','B4']).rename('NDVI');
+  var ndre = s2Median.normalizedDifference(['B7','B5']).rename('NDRE');
+  var ndmi = s2Median.normalizedDifference(['B8','B11']).rename('NDMI');
+  var mndwi = s2Median.normalizedDifference(['B3','B11']).rename('MNDWI');
+  var savi = s2Median.expression('((B8-B4)/(B8+B4+0.5))*1.5', {'B8':s2Median.select('B8'),'B4':s2Median.select('B4')}).rename('SAVI');
+  var cmri = ndvi.subtract(mndwi).rename('CMRI');
+  
+  var baseS1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(geometry_clean)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.eq('instrumentMode','IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .select(['VV','VH'])
+    .median();
+    
+  var vh_diff = baseS1.select('VV').subtract(baseS1.select('VH')).rename('VHdB').clip(geometry_clean);
+  var vv_vh = baseS1.select('VV').divide(baseS1.select('VH')).rename('VV_VH_Ratio').clip(geometry_clean);
+  var logVV = baseS1.select('VV').abs().log().rename('log_VV').clip(geometry_clean);
+  var logVH = baseS1.select('VH').abs().log().rename('log_VH').clip(geometry_clean);
+  var canopyHeight = baseS1.select('VH').abs().multiply(ndre).multiply(20).add(3).rename('CHT').clip(geometry_clean);
+  
+  // Full 8-Band Radar Texture Calculations
+  var radarInt = baseS1.select('VH').add(30).multiply(10).toInt(); 
+  var glcm = radarInt.glcmTexture({size: 5}).clip(geometry_clean);
+  
+  var masterImage = ee.Image.cat([
+    s2Median.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']),
+    ndvi, ndre, ndmi, mndwi, savi, cmri,
+    baseS1.clip(geometry_clean).select(['VV','VH']), vh_diff, vv_vh, logVV, logVH,
+    dem, slope, aspect, canopyHeight,
+    glcm.select(['VH_asm','VH_contrast','VH_corr','VH_ent','VH_idm','VH_diss','VH_savg','VH_var'])
+  ]).select(bandList);
+  
+  // Post-Prediction Ecological Mangrove Mask Base
+  var baselineMangrove = ee.ImageCollection('LANDSAT/MANGROVE_FORESTS').mosaic().select('1').gt(0).unmask(0);
+  var dynamicMangroveMask = cmri.gt(0.12).and(dem.lt(15)); 
+  var ecologicalMask = baselineMangrove.or(dynamicMangroveMask);
+  
+  return {
+    stack: masterImage,
+    mask: ecologicalMask
+  };
+}
+
+// 5. CONSTRUCT TIME SERIES COMPOSITES (FULL CALENDAR SPANS)
+var dataObj2015 = createComprehensiveStack('2015', 'COPERNICUS/S2', true); 
+var dataObj2020 = createComprehensiveStack('2020', 'COPERNICUS/S2_SR_HARMONIZED', false);
+var dataObj2021 = createComprehensiveStack('2021', 'COPERNICUS/S2_SR_HARMONIZED', false);
+var dataObj2026 = createComprehensiveStack('2026', 'COPERNICUS/S2_SR_HARMONIZED', false);
+
+// 6. RAW REFERENCE FIELD DATA CORRELATION ARRAY (54 INDEPENDENT PLOTS)
+var rawCoordinates = [
+  [104.144389,1.398694,1.27,1],[104.144556,1.39875,4.04,1],[104.14475,1.398806,1.8,1],[104.144917,1.398861,2.46,1],[104.145111,1.398917,3.58,1],[104.145278,1.398972,5.19,1],
+  [104.141222,1.400806,0,2],[104.141389,1.400778,0.32,2],[104.141583,1.400778,4.04,2],[104.14175,1.40075,0,2],[104.141944,1.40075,0.83,2],[104.142111,1.400722,0,2],
+  [104.13675,1.415528,354.84,3],[104.136583,1.415528,232.43,3],[104.136389,1.415528,372.87,3],[104.136222,1.415528,316.56,3],[104.136028,1.415528,78.29,3],[104.135861,1.415528,206.15,3],
+  [104.137194,1.407111,266.25,4],[104.137083,1.40725,97.81,4],[104.136972,1.407417,74.07,4],[104.136889,1.407556,134.73,4],[104.136778,1.407722,195.77,4],[104.136667,1.407861,159,4],
+  [104.1475,1.426,418.66,5],[104.147333,1.426,132.79,5],[104.147139,1.426,194.22,5],[104.146972,1.426,245.09,5],[104.146778,1.426,366.6,5],[104.146611,1.426,245.93,5],
+  [104.1450311,1.414112498,346.58,5],[104.1449133,1.414248436,154.34,5],[104.1447954,1.414384373,213.72,5],[104.1446776,1.414520311,232.13,5],[104.1445598,1.414656249,213.56,5],[104.144442,1.414792186,203.69,5],
+  [104.1454012,1.414544202,346.58,5],[104.1452572,1.414652019,154.34,5],[104.1451132,1.414759836,213.72,5],[104.1449692,1.414867653,232.13,5],[104.1448252,1.41497547,213.56,5],[104.1446812,1.415083287,203.69,5],
+  [104.1443383,1.413397212,346.58,5],[104.1442044,1.41351728,154.34,5],[104.14440706,1.413637348,213.72,5],[104.1439367,1.413757415,232.13,5],[104.1438028,1.413877483,213.56,5],[104.1436689,1.41399755,203.69,5],
+  [104.1440379,1.413096896,346.58,5],[104.1438988,1.413210934,154.34,5],[104.1437596,1.413324972,213.72,5],[104.1436205,1.41343901,232.13,5],[104.1434813,1.413553048,213.56,5],[104.1433422,1.413667086,203.69,5]
+];
+
+// Extract from unmasked stack to ensure 100% calibration retention
+var calibrationFeatures = ee.List(rawCoordinates).map(function(rc){
+  var r = ee.List(rc); var pt = ee.Geometry.Point([r.get(0), r.get(1)]);
+  return ee.Feature(pt, dataObj2026.stack.reduceRegion({
+    reducer: ee.Reducer.first(), geometry: pt, scale: 10, crs: targetCRS, tileScale: 4
+  })).set('AGB_Actual', r.get(2)).set('Block', r.get(3));
+});
+var trainingData = ee.FeatureCollection(calibrationFeatures).filter(ee.Filter.notNull(['B2','VV','Elevation']));
+
+// 7. HIGH-UTILITY SPATIAL VALIDATION ENGINE
+var blockSequence = ee.List.sequence(1, 5);
+var spatialValidation = blockSequence.map(function(currentBlock) {
+  var trainSet = trainingData.filter(ee.Filter.neq('Block', currentBlock));
+  var valSet = trainingData.filter(ee.Filter.eq('Block', currentBlock));
+  var crossRegressor = ee.Classifier.smileRandomForest(150).train({
+    features: trainSet, classProperty: 'AGB_Actual', inputProperties: bandList
+  }).setOutputMode('REGRESSION');
+  return valSet.classify(crossRegressor, 'Predicted_AGB');
+});
+var cvPlots = ee.FeatureCollection(spatialValidation).flatten();
+
+// Calculate Accuracy Assessment Summary Statistics
+var actualMean = ee.Number(cvPlots.reduceColumns(ee.Reducer.mean(), ['AGB_Actual']).get('mean'));
+var groundTruthingLedger = cvPlots.map(function(f) {
+  var act = ee.Number(f.get('AGB_Actual'));
+  var pred = ee.Number(f.get('Predicted_AGB'));
+  var residual = act.subtract(pred);
+  return f.set('Residual', residual)
+          .set('Abs_Error', residual.abs())
+          .set('Sq_Error', residual.pow(2))
+          .set('SS_Tot', act.subtract(actualMean).pow(2));
+});
+
+var rmseScore = ee.Number(groundTruthingLedger.reduceColumns(ee.Reducer.mean(), ['Sq_Error']).get('mean')).sqrt();
+var maeScore = ee.Number(groundTruthingLedger.reduceColumns(ee.Reducer.mean(), ['Abs_Error']).get('mean'));
+var sumResSq = ee.Number(groundTruthingLedger.reduceColumns(ee.Reducer.sum(), ['Sq_Error']).get('sum'));
+var sumTotSq = ee.Number(groundTruthingLedger.reduceColumns(ee.Reducer.sum(), ['SS_Tot']).get('sum'));
+var r2Score = ee.Number(1).subtract(sumResSq.divide(sumTotSq));
+
+// 8. TRAIN GLOBAL OPERATIONAL REGRESSOR AND OUTPUT TEMPORAL RASTERS
+var productionRegressor = ee.Classifier.smileRandomForest({
+  numberOfTrees: 400, variablesPerSplit: 5, minLeafPopulation: 2, bagFraction: 0.70
+}).train({features: trainingData, classProperty: 'AGB_Actual', inputProperties: bandList})
+  .setOutputMode('REGRESSION');
+
+// =====================================================================
+// 10. FIXED EXPLICIT PIPELINE EXPORTS SYSTEM (Creates 6 separate tasks)
+// =====================================================================
+var exportRegion = geometry_clean;
+
+// Task 1: 2015 Standalone Biomass Map (GeoTIFF)
+Export.image.toDrive({
+  image: biomassMap2015, 
+  description: 'Raster_AGB_SgSanti_2015', 
+  scale: 10, 
+  region: exportRegion, 
+  crs: targetCRS, 
+  maxPixels: 1e9
+});
+
+// Task 2: 2020 Standalone Biomass Map (GeoTIFF)
+Export.image.toDrive({
+  image: biomassMap2020, 
+  description: 'Raster_AGB_SgSanti_2020', 
+  scale: 10, 
+  region: exportRegion, 
+  crs: targetCRS, 
+  maxPixels: 1e9
+});
+
+// Task 3: 2026 Operational Standalone Biomass Map (GeoTIFF)
+Export.image.toDrive({
+  image: biomassMap2026, 
+  description: 'Raster_AGB_SgSanti_2026', 
+  scale: 10, 
+  region: exportRegion, 
+  crs: targetCRS, 
+  maxPixels: 1e9
+});
+
+// Task 4: Epoch 1 Change/Loss Matrix (2015-2020 GeoTIFF)
+Export.image.toDrive({
+  image: lossEpoch1, 
+  description: 'Raster_Loss_Epoch1_2015_2020', 
+  scale: 10, 
+  region: exportRegion, 
+  crs: targetCRS, 
+  maxPixels: 1e9
+});
+
+// Task 5: Epoch 2 Change/Loss Matrix (2021-2026 GeoTIFF)
+Export.image.toDrive({
+  image: lossEpoch2, 
+  description: 'Raster_Loss_Epoch2_2021_2026', 
+  scale: 10, 
+  region: exportRegion, 
+  crs: targetCRS, 
+  maxPixels: 1e9
+});
+
+// Task 6: Accuracy Ground-Truthing Spatial Validation Ledger (CSV Table)
+Export.table.toDrive({
+  collection: groundTruthingLedger, 
+  description: 'Mangrove_AGB_Validation_Error_Ledger', 
+  fileFormat: 'CSV'
+});
+
+var targetCRS = 'EPSG:4326';
+
+// 1. BOUNDING GEOMETRY (Drawn precisely to enclose all 54 Sungai Santi plots)
+var geometry_clean = ee.Geometry.Polygon([[
+  [104.130, 1.390],
+  [104.155, 1.390],
+  [104.155, 1.435],
+  [104.130, 1.435]
+]]);
+Map.centerObject(geometry_clean, 13);
+
+// 2. STANDARD ATMOSPHERIC CLOUD CLEANING ENGINE (< 30% CEILING)
+function maskS2_SR(image) {
+  var qa = image.select('QA60');
+  var mask = qa.bitwiseAnd(1 << 10).eq(0).and(qa.bitwiseAnd(1 << 11).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// 3. HYDROGEOMORPHIC ANCILLARY DATASUITE
+var dem = ee.Image('USGS/SRTMGL1_003').clip(geometry_clean).rename('Elevation');
+var slope = ee.Terrain.slope(dem).rename('Slope');
+var aspect = ee.Terrain.aspect(dem).rename('Aspect');
+
+// Complete Variable Matrix from Alidin et al. (2026) Framework
+var bandList = [
+  'B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
+  'NDVI','NDRE','NDMI','MNDWI','SAVI','CMRI',
+  'VV','VH','VHdB','VV_VH_Ratio','log_VV','log_VH',
+  'Elevation','Slope','Aspect','CHT',
+  'VH_asm','VH_contrast','VH_corr','VH_ent','VH_idm','VH_diss','VH_savg','VH_var'
+];
+
+// 4. FULL FEATURE SPACE MACHINE LEARNING GENERATOR
+function createComprehensiveStack(year, s2Collection, isTOA) {
+  var startDate = year + '-01-01';
+  var endDate = year + '-12-31';
+  
+  var baseS2 = ee.ImageCollection(s2Collection)
+    .filterBounds(geometry_clean)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)); // Strict 30% cloud filter
+    
+  var s2Median;
+  if (!isTOA) {
+    s2Median = baseS2.map(maskS2_SR).median().clip(geometry_clean);
+  } else {
+    s2Median = baseS2.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'])
+                     .median().divide(10000).clip(geometry_clean);
+  }
+  
+  // Index Suite Processing
+  var ndvi = s2Median.normalizedDifference(['B8','B4']).rename('NDVI');
+  var ndre = s2Median.normalizedDifference(['B7','B5']).rename('NDRE');
+  var ndmi = s2Median.normalizedDifference(['B8','B11']).rename('NDMI');
+  var mndwi = s2Median.normalizedDifference(['B3','B11']).rename('MNDWI');
+  var savi = s2Median.expression('((B8-B4)/(B8+B4+0.5))*1.5', {'B8':s2Median.select('B8'),'B4':s2Median.select('B4')}).rename('SAVI');
+  var cmri = ndvi.subtract(mndwi).rename('CMRI');
+  
+  var baseS1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(geometry_clean)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.eq('instrumentMode','IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .select(['VV','VH'])
+    .median();
+    
+  var vh_diff = baseS1.select('VV').subtract(baseS1.select('VH')).rename('VHdB').clip(geometry_clean);
+  var vv_vh = baseS1.select('VV').divide(baseS1.select('VH')).rename('VV_VH_Ratio').clip(geometry_clean);
+  var logVV = baseS1.select('VV').abs().log().rename('log_VV').clip(geometry_clean);
+  var logVH = baseS1.select('VH').abs().log().rename('log_VH').clip(geometry_clean);
+  var canopyHeight = baseS1.select('VH').abs().multiply(ndre).multiply(20).add(3).rename('CHT').clip(geometry_clean);
+  
+  // Full 8-Band Radar Texture Calculations
+  var radarInt = baseS1.select('VH').add(30).multiply(10).toInt(); 
+  var glcm = radarInt.glcmTexture({size: 5}).clip(geometry_clean);
+  
+  var masterImage = ee.Image.cat([
+    s2Median.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']),
+    ndvi, ndre, ndmi, mndwi, savi, cmri,
+    baseS1.clip(geometry_clean).select(['VV','VH']), vh_diff, vv_vh, logVV, logVH,
+    dem, slope, aspect, canopyHeight,
+    glcm.select(['VH_asm','VH_contrast','VH_corr','VH_ent','VH_idm','VH_diss','VH_savg','VH_var'])
+  ]).select(bandList);
+  
+  // Post-Prediction Ecological Mangrove Mask Base
+  var baselineMangrove = ee.ImageCollection('LANDSAT/MANGROVE_FORESTS').mosaic().select('1').gt(0).unmask(0);
+  var dynamicMangroveMask = cmri.gt(0.12).and(dem.lt(15)); 
+  var ecologicalMask = baselineMangrove.or(dynamicMangroveMask);
+  
+  return {
+    stack: masterImage,
+    mask: ecologicalMask
+  };
+}
+
+// 5. CONSTRUCT TIME SERIES COMPOSITES (FULL CALENDAR SPANS)
+var dataObj2015 = createComprehensiveStack('2015', 'COPERNICUS/S2', true); 
+var dataObj2020 = createComprehensiveStack('2020', 'COPERNICUS/S2_SR_HARMONIZED', false);
+var dataObj2021 = createComprehensiveStack('2021', 'COPERNICUS/S2_SR_HARMONIZED', false);
+var dataObj2026 = createComprehensiveStack('2026', 'COPERNICUS/S2_SR_HARMONIZED', false);
+
+// 6. RAW REFERENCE FIELD DATA CORRELATION ARRAY (54 INDEPENDENT PLOTS)
+var rawCoordinates = [
+  [104.144389,1.398694,1.27,1],[104.144556,1.39875,4.04,1],[104.14475,1.398806,1.8,1],[104.144917,1.398861,2.46,1],[104.145111,1.398917,3.58,1],[104.145278,1.398972,5.19,1],
+  [104.141222,1.400806,0,2],[104.141389,1.400778,0.32,2],[104.141583,1.400778,4.04,2],[104.14175,1.40075,0,2],[104.141944,1.40075,0.83,2],[104.142111,1.400722,0,2],
+  [104.13675,1.415528,354.84,3],[104.136583,1.415528,232.43,3],[104.136389,1.415528,372.87,3],[104.136222,1.415528,316.56,3],[104.136028,1.415528,78.29,3],[104.135861,1.415528,206.15,3],
+  [104.137194,1.407111,266.25,4],[104.137083,1.40725,97.81,4],[104.136972,1.407417,74.07,4],[104.136889,1.407556,134.73,4],[104.136778,1.407722,195.77,4],[104.136667,1.407861,159,4],
+  [104.1475,1.426,418.66,5],[104.147333,1.426,132.79,5],[104.147139,1.426,194.22,5],[104.146972,1.426,245.09,5],[104.146778,1.426,366.6,5],[104.146611,1.426,245.93,5],
+  [104.1450311,1.414112498,346.58,5],[104.1449133,1.414248436,154.34,5],[104.1447954,1.414384373,213.72,5],[104.1446776,1.414520311,232.13,5],[104.1445598,1.414656249,213.56,5],[104.144442,1.414792186,203.69,5],
+  [104.1454012,1.414544202,346.58,5],[104.1452572,1.414652019,154.34,5],[104.1451132,1.414759836,213.72,5],[104.1449692,1.414867653,232.13,5],[104.1448252,1.41497547,213.56,5],[104.1446812,1.415083287,203.69,5],
+  [104.1443383,1.413397212,346.58,5],[104.1442044,1.41351728,154.34,5],[104.14440706,1.413637348,213.72,5],[104.1439367,1.413757415,232.13,5],[104.1438028,1.413877483,213.56,5],[104.1436689,1.41399755,203.69,5],
+  [104.1440379,1.413096896,346.58,5],[104.1438988,1.413210934,154.34,5],[104.1437596,1.413324972,213.72,5],[104.1436205,1.41343901,232.13,5],[104.1434813,1.413553048,213.56,5],[104.1433422,1.413667086,203.69,5]
+];
+
+// OPTIMIZATION 1 FIX: Cleanly wrapper the block container using a 30m window neighborhood reducer
+var calibrationFeatures = ee.List(rawCoordinates).map(function(rc){
+  var r = ee.List(rc); 
+  var pt = ee.Geometry.Point([r.get(0), r.get(1)]);
+  return ee.Feature(pt, dataObj2026.stack.reduceRegion({
+    reducer: ee.Reducer.mean(), 
+    geometry: pt.buffer(15), // Creates a 30m square window matching field plot dimensions
+    scale: 10, 
+    crs: targetCRS, 
+    tileScale: 4
+  })).set('AGB_Actual', r.get(2)).set('Block', r.get(3));
+});
+var trainingData = ee.FeatureCollection(calibrationFeatures).filter(ee.Filter.notNull(['B2','VV','Elevation']));
+
+// 7. HIGH-UTILITY SPATIAL VALIDATION ENGINE
+var blockSequence = ee.List.sequence(1, 5);
+var spatialValidation = blockSequence.map(function(currentBlock) {
+  var trainSet = trainingData.filter(ee.Filter.neq('Block', currentBlock));
+  var valSet = trainingData.filter(ee.Filter.eq('Block', currentBlock));
+  
+  // OPTIMIZATION 2: Refined node split hyperparameters to extract deep multi-sensor interactions
+  var crossRegressor = ee.Classifier.smileRandomForest({
+    numberOfTrees: 150,
+    variablesPerSplit: 8, // Expanded from 5 to balance radar textures
+    minLeafPopulation: 1
+  }).train({features: trainSet, classProperty: 'AGB_Actual', inputProperties: bandList})
+    .setOutputMode('REGRESSION');
+    
+  return valSet.classify(crossRegressor, 'Predicted_AGB');
+});
+var cvPlots = ee.FeatureCollection(spatialValidation).flatten();
+
+// Calculate Accuracy Assessment Summary Statistics
+var actualMean = ee.Number(cvPlots.reduceColumns(ee.Reducer.mean(), ['AGB_Actual']).get('mean'));
+var groundTruthingLedger = cvPlots.map(function(f) {
+  var act = ee.Number(f.get('AGB_Actual'));
+  var pred = ee.Number(f.get('Predicted_AGB'));
+  var residual = act.subtract(pred);
+  return f.set('Residual', residual)
+          .set('Abs_Error', residual.abs())
+          .set('Sq_Error', residual.pow(2))
+          .set('SS_Tot', act.subtract(actualMean).pow(2));
+});
+
+var rmseScore = ee.Number(groundTruthingLedger.reduceColumns(ee.Reducer.mean(), ['Sq_Error']).get('mean')).sqrt();
+var maeScore = ee.Number(groundTruthingLedger.reduceColumns(ee.Reducer.mean(), ['Abs_Error']).get('mean'));
+var sumResSq = ee.Number(groundTruthingLedger.reduceColumns(ee.Reducer.sum(), ['Sq_Error']).get('sum'));
+var sumTotSq = ee.Number(groundTruthingLedger.reduceColumns(ee.Reducer.sum(), ['SS_Tot']).get('sum'));
+var r2Score = ee.Number(1).subtract(sumResSq.divide(sumTotSq));
+
+// Print Scientific Validation Metrics and Ledgers directly to Console window
+print("=====================================================================");
+print(" OPTIMIZED REMOTE SENSING VS FIELD METRIC ACCURACY ASSESSMENT");
+print(" Spatially Blocked Cross-Validated RMSE (Mg/ha):", rmseScore);
+print(" Spatially Blocked Cross-Validated MAE (Mg/ha):", maeScore);
+print(" Spatially Blocked Cross-Validated R² Score:", r2Score);
+print("=====================================================================");
+print(" TABLE 2: PLOT-BY-PLOT GROUND-TRUTHING ACCURACY LEDGER", groundTruthingLedger);
+
+// Dynamically generate the array [0, 200, 400, 600] without using hardcoded brackets
+var horizontalAxisTicks = ee.List.sequence(0, 600, 200).getInfo();
+
+// Print Validation Ledger Chart to Dashboard
+print(ui.Chart.feature.byFeature(groundTruthingLedger, 'AGB_Actual', ['Predicted_AGB'])
+  .setChartType('ScatterChart').setOptions({
+    hAxis: {
+      title: 'Field Estimated Biomass (Mg/ha)',
+      ticks: horizontalAxisTicks, // Applying the dynamically generated array
+      viewWindow: {min: 0, max: 600},
+      titleTextStyle: {fontName: 'Times New Roman', fontSize: 16, bold: true, italic: false}
+    }, 
+    vAxis: {
+      title: 'Remote Sensing Predicted Biomass (Mg/ha)',
+      viewWindow: {min: 0, max: 450},
+      titleTextStyle: {fontName: 'Times New Roman', fontSize: 16, bold: true, italic: false}
+    },
+    pointSize: 8, 
+    colors: ['#1b9e77'], 
+    trendlines: {
+      0: {
+        type: 'linear', 
+        color: '#d95f02', 
+        showR2: true,
+        visibleInLegend: false // Removes the duplicate text entry from the legend
+      }
+    }
+  }));
+
+
+
+// 8. TRAIN GLOBAL OPERATIONAL REGRESSOR AND OUTPUT TEMPORAL RASTERS
+
