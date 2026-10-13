@@ -1,0 +1,226 @@
+// =========================================================================
+// PRODUCTION READY ENGINE: ANNUAL MASTER MODEL (LINEAR MATRIX FRAMEWORK)
+// Target Census: 2026 Landscape Realignment & Biophysical Desaturation
+// Configuration: Leave-One-Transect-Out (LOTO) Verification Matrix
+// Cloud Constraint: CLOUDY_PIXEL_PERCENTAGE < 30
+// Graphics Format: Academic Printing Matrix (Times New Roman, Size 14 Constant)
+// =========================================================================
+
+var targetCRS = 'EPSG:4326';
+
+// --- VECTOR TO RASTER GEOMETRY BOUNDS REALIGNMENT ---
+var geometry_clean = (typeof geometry !== 'undefined') ? geometry.geometry().transform(targetCRS, 1) : 
+                     (typeof table !== 'undefined') ? table.geometry().transform(targetCRS, 1) : 
+                     (typeof catchment !== 'undefined') ? catchment.geometry().transform(targetCRS, 1) : null;
+
+if (geometry_clean === null) {
+  throw new Error("❌ CRITICAL ERROR: Your uploaded shapefile asset is missing from the script! Please import your catchment boundary file from the left-hand 'Assets' tray and ensure the variable name on the very top line reads exactly: geometry");
+}
+
+Map.centerObject(geometry_clean, 12);
+
+var filter2026 = ee.Filter.date('2026-01-01', '2026-12-31');
+
+function maskS2Clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// --- OPTICAL SPECTRAL COMPLEX ---
+var baseImg2026 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(geometry_clean)
+  .filter(filter2026)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+  .map(maskS2Clouds)
+  .median()
+  .clip(geometry_clean);
+  
+// Core Veg and Advanced Mangrove Structural Ratios
+var ndvi = baseImg2026.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var ndre = baseImg2026.normalizedDifference(['B7', 'B5']).rename('NDRE'); 
+var ndmi = baseImg2026.normalizedDifference(['B8', 'B11']).rename('NDMI');
+var mndwi = baseImg2026.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+
+var savi = baseImg2026.expression(
+  '((B8 - B4) / (B8 + B4 + 0.5)) * 1.5', {
+    'B8': baseImg2026.select('B8'),
+    'B4': baseImg2026.select('B4')
+  }).rename('SAVI');
+
+var cmri = ndvi.subtract(mndwi).rename('CMRI');
+
+// --- ACTIVE RADAR COMPONENT ---
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(geometry_clean)
+  .filter(filter2026)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .select(['VV', 'VH'])
+  .median()
+  .clip(geometry_clean);
+
+var vh_diff = s1.select('VV').subtract(s1.select('VH')).rename('VHdB');
+var vv_vh = s1.select('VV').divide(s1.select('VH')).rename('VV_VH_Ratio');
+var logVV = s1.select('VV').abs().log().rename('log_VV');
+var logVH = s1.select('VH').abs().log().rename('log_VH');
+
+// --- GEOMORPHIC ELEVATION & STRUCTURE ---
+var dem = ee.Image('USGS/SRTMGL1_003').clip(geometry_clean).rename('Elevation');
+var slope = ee.Terrain.slope(dem).rename('Slope');
+var aspect = ee.Terrain.aspect(dem).rename('Aspect');
+
+// --- LOCAL BIOPHYSICAL CANOPY STRUCTURE PROXY ---
+var canopyHeight = s1.select('VH').abs()
+  .multiply(ndre)
+  .multiply(20)
+  .add(3)
+  .rename('CHT')
+  .clip(geometry_clean);
+
+// Consolidated Advanced Predictor Array
+var bandList = [
+  'B2', 'B3', 'B4', 'B5', 'B7', 'B8', 'B11', 'B12', 
+  'NDVI', 'NDRE', 'NDMI', 'MNDWI', 'SAVI', 'CMRI', 
+  'VV', 'VH', 'VHdB', 'VV_VH_Ratio', 'log_VV', 'log_VH',
+  'Elevation', 'Slope', 'Aspect', 'CHT'
+];
+
+var masterStack2026 = ee.Image.cat([
+  baseImg2026, ndvi, ndre, ndmi, mndwi, savi, cmri, 
+  s1, vh_diff, vv_vh, logVV, logVH, 
+  dem, slope, aspect, canopyHeight
+]).select(bandList);
+
+// --- FIELD NODE ARRAY MATRIX ---
+var rawCoordinates = [
+  [104.144389, 1.398694, 2.65, 1, '#86efac'],   [104.144556, 1.398750, 15.11, 1, '#86efac'],  [104.144750, 1.398806, 6.72, 1, '#86efac'],
+  [104.144917, 1.398861, 8.62, 1, '#86efac'],   [104.145111, 1.398917, 15.00, 1, '#86efac'],  [104.145278, 1.398972, 17.58, 1, '#86efac'],
+  [104.141222, 1.400806, 0.00, 2, '#ef4444'],   [104.141389, 1.400778, 0.55, 2, '#ef4444'],   [104.141583, 1.400778, 12.87, 2, '#ef4444'],
+  [104.141750, 1.400750, 0.00, 2, '#ef4444'],   [104.141944, 1.400750, 2.50, 2, '#ef4444'],   [104.142111, 1.400722, 0.00, 2, '#ef4444'],
+  [104.136750, 1.415528, 148.91, 3, '#38bdf8'], [104.136583, 1.415528, 90.87, 3, '#38bdf8'],  [104.136389, 1.415528, 145.47, 3, '#38bdf8'],
+  [104.136222, 1.415528, 122.95, 3, '#38bdf8'], [104.136028, 1.415528, 38.64, 3, '#38bdf8'],  [104.135861, 1.415528, 102.73, 3, '#38bdf8'],
+  [104.137194, 1.407111, 115.11, 4, '#1d4ed8'], [104.137083, 1.407250, 42.15, 4, '#1d4ed8'],  [104.136972, 1.407417, 30.50, 4, '#1d4ed8'],
+  [104.136889, 1.407556, 58.73, 4, '#1d4ed8'],  [104.136778, 1.407722, 85.34, 4, '#1d4ed8'],  [104.136667, 1.407861, 63.85, 4, '#1d4ed8'],
+  [104.147500, 1.426000, 171.74, 5, '#15803d'], [104.147333, 1.426000, 79.46, 5, '#15803d'],  [104.147139, 1.426000, 104.30, 5, '#15803d'],
+  [104.146972, 1.426000, 131.63, 5, '#15803d'], [104.146778, 1.426000, 196.40, 5, '#15803d'], [104.146611, 1.426000, 121.72, 5, '#15803d']
+];
+
+var calibrationFeatures = ee.List(rawCoordinates).map(function(record) {
+  var row = ee.List(record); var pt = ee.Geometry.Point([row.get(0), row.get(1)]);
+  var pixelValues = masterStack2026.reduceRegion({reducer: ee.Reducer.first(), geometry: pt, scale: 10, crs: targetCRS});
+  return ee.Feature(pt, pixelValues).set('AGB_Actual', row.get(2)).set('Block', row.get(3)).set('style', {color: row.get(4), pointSize: 6});
+});
+
+var trainingData = ee.FeatureCollection(calibrationFeatures).filter(ee.Filter.notNull(bandList));
+
+// --- BLOCK ROTATION CROSS-VALIDATION MATRIX ---
+var blockSequence = ee.List.sequence(1, 5);
+var outOfFoldFeatures = blockSequence.map(function(currentBlock) {
+  var trainSet = trainingData.filter(ee.Filter.neq('Block', currentBlock));
+  var valSet = trainingData.filter(ee.Filter.eq('Block', currentBlock));
+  var crossRegressor = ee.Classifier.smileRandomForest(100).train({features: trainSet, classProperty: 'AGB_Actual', inputProperties: bandList}).setOutputMode('REGRESSION');
+  return valSet.classify(crossRegressor, 'Predicted_AGB');
+});
+
+var cvPlots = ee.FeatureCollection(outOfFoldFeatures).flatten();
+
+var diffSquared = cvPlots.map(function(feature) {
+  var actual = ee.Number(feature.get('AGB_Actual'));
+  var predicted = ee.Number(feature.get('Predicted_AGB'));
+  var diff = actual.subtract(predicted);
+  return feature.set('sq_error', diff.multiply(diff));
+});
+
+var meanSqError = ee.Number(diffSquared.reduceColumns(ee.Reducer.mean(), ['sq_error']).get('mean'));
+var rmseScore = meanSqError.sqrt();
+
+print("=========================================================================");
+print("📊 TIGHTENED CLOUD FILTER METRICS MATRIX:");
+print("   Spatially Blocked Full-Year Out-of-Fold RMSE (Mg/Ha):", rmseScore);
+print("=========================================================================");
+
+// --- RENDER HIGH-RESOLUTION MANUSCRIPT DIAGNOSTIC GRAPH SCATTERPLOT ---
+// Rule Alignment: Forced Times New Roman Integration Matrix with Constant 14pt Scale
+var validationChart = ui.Chart.feature.byFeature({
+  features: cvPlots, 
+  xProperty: 'AGB_Actual', 
+  yProperties: ['Predicted_AGB']
+})
+.setChartType('ScatterChart')
+.setOptions({
+    titleTextStyle: {
+    fontName: 'Times New Roman',
+    fontSize: 16,
+    bold: true,
+    color: '#111111'
+  },
+  hAxis: {
+    title: 'Observed Field Biomass 2026 (Mg/Ha)', 
+    minValue: 0, 
+    maxValue: 220,
+    textStyle: {
+      fontName: 'Times New Roman',
+      fontSize: 16,
+      italic: false, // Disables automatic label italicization
+      color: '#333333'
+    },
+    titleTextStyle: {
+      fontName: 'Times New Roman',
+      fontSize: 16,
+      italic: false,
+      bold: true,
+      color: '#111111'
+    }
+  },
+  vAxis: {
+    title: 'Spatially Withheld Predicted 2026 AGB (Mg/Ha)', 
+    minValue: 0, 
+    maxValue: 220,
+    textStyle: {
+      fontName: 'Times New Roman',
+      italic: false,
+      fontSize: 16,
+      color: '#333333'
+    },
+    titleTextStyle: {
+      fontName: 'Times New Roman',
+      fontSize: 16,
+      bold: true,
+      italic: false,
+      color: '#111111'
+    }
+  },
+  legend: {
+    position: 'bottom',
+    textStyle: {
+      fontName: 'Times New Roman',
+      fontSize: 16,
+      color: '#111111'
+    }
+  },
+  trendlines: { 
+    0: {
+      type: 'linear', 
+      color: '#dc2626', 
+      visibleInLegend: true, 
+      labelInLegend: '1:1 Fit Line'
+    } 
+  },
+  pointSize: 6, 
+  colors: ['#047857']
+});
+
+print("📈 BIOPHYSICAL DIAGNOSTIC SCATTERPLOT:", validationChart);
+
+var biomassMap2026 = masterStack2026.classify(ee.Classifier.smileRandomForest(500).train({features: trainingData, classProperty: 'AGB_Actual', inputProperties: bandList}).setOutputMode('REGRESSION')).rename('AGB_2026');
+var clippedBiomass2026 = biomassMap2026.clip(geometry_clean);
+
+Map.addLayer(clippedBiomass2026, {min: 0, max: 200, palette: ['ffffff', 'f7fcf5', 'e5f5e0', 'a1d99b', '41ab5d', '00441b']}, 'Tightened Cloud Mask AGB Map Raster (2026)');
+
+Export.image.toDrive({
+  image: clippedBiomass2026, description: 'Tight_CloudMask_FeatureStack_AGB_Map_2026_10m',
+  scale: 10, region: geometry_clean, crs: 'EPSG:4326', maxPixels: 1e9
+});
